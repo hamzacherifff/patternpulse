@@ -1,0 +1,54 @@
+services:
+  dashboard:
+    build: .
+    command: streamlit run app.py --server.address=0.0.0.0 --server.port=8501 --server.headless=true
+    # Not published directly -- nginx is the only container exposed to the host and proxies
+    # every request through to here.
+    expose:
+      - "8501"
+    volumes:
+      - data:/app/data_store
+      - logs:/app/logs
+    env_file: .env
+    restart: unless-stopped
+
+  scanner:
+    build: .
+    command: python -m jobs.live_scanner
+    volumes:
+      - data:/app/data_store
+      - logs:/app/logs
+    env_file: .env
+    restart: unless-stopped
+
+  outcome_updater:
+    build: .
+    command: python -m jobs.outcome_updater
+    volumes:
+      - data:/app/data_store
+      - logs:/app/logs
+    env_file: .env
+    restart: unless-stopped
+
+  telegram_bot:
+    build: .
+    command: python -m telegram_bot.bot
+    volumes:
+      - data:/app/data_store
+      - logs:/app/logs
+    env_file: .env
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - dashboard
+    restart: unless-stopped
+
+volumes:
+  data:
+  logs:

@@ -1,0 +1,8 @@
+.venv
+data_store
+logs
+.env
+__pycache__
+*.pyc
+streamlit.log
+.git
