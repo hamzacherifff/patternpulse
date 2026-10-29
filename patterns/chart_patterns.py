@@ -645,9 +645,18 @@ def detect_bull_trap(df: pd.DataFrame, peaks, lookback: int = 40, confirm_window
     if df["close"].iloc[last_idx] >= resistance:
         return None
     high_after = float(after["high"].max())
+    entry_now = float(df["close"].iloc[last_idx])
+    overshoot = high_after - resistance
+    # Target anchored to the actual entry price, not to the stale resistance level -- by the
+    # time this pattern confirms, price has already reverted partway back through resistance,
+    # so a target measured FROM resistance can end up barely past (or even behind) entry,
+    # which produced a catastrophic ~0.08:1 reward:risk in production (see
+    # core/config.py's min_reward_risk_ratio docstring). Measuring the same overshoot distance
+    # from entry instead keeps the target a real, tradeable distance away regardless of how
+    # far price already reverted before the signal fired.
     return {
         "pattern": "bull_trap", "direction": "short", "status": "confirmed",
-        "invalidation_price": high_after * 1.01, "target_price": resistance - (high_after - resistance),
+        "invalidation_price": high_after * 1.01, "target_price": entry_now - overshoot,
         "strength": 0.55,
         "key_points": [_pt(resistance_idx, resistance, "Resistance"), _pt(most_recent_breakout, high_after, "False breakout")],
         "trend_lines": [_line([(resistance_idx, resistance), (last_idx, resistance)], "Resistance")],
@@ -672,9 +681,12 @@ def detect_bear_trap(df: pd.DataFrame, troughs, lookback: int = 40, confirm_wind
     if df["close"].iloc[last_idx] <= support:
         return None
     low_after = float(after["low"].min())
+    entry_now = float(df["close"].iloc[last_idx])
+    undershoot = support - low_after
+    # Same entry-anchored fix as detect_bull_trap -- see that function's comment.
     return {
         "pattern": "bear_trap", "direction": "long", "status": "confirmed",
-        "invalidation_price": low_after * 0.99, "target_price": support + (support - low_after),
+        "invalidation_price": low_after * 0.99, "target_price": entry_now + undershoot,
         "strength": 0.55,
         "key_points": [_pt(support_idx, support, "Support"), _pt(most_recent_breakdown, low_after, "False breakdown")],
         "trend_lines": [_line([(support_idx, support), (last_idx, support)], "Support")],

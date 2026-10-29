@@ -39,6 +39,14 @@ class RiskConfig:
     default_portfolio_size: float = field(default_factory=lambda: _env_float("DEFAULT_PORTFOLIO_SIZE", 1000.0))
     default_max_risk_pct: float = field(default_factory=lambda: _env_float("DEFAULT_MAX_RISK_PCT", 1.0))
     atr_stop_multiple: float = field(default_factory=lambda: _env_float("ATR_STOP_MULTIPLE", 1.5))
+    # Real production data (1293 resolved signals) showed 95% of signals had a target closer
+    # than the stop (median reward:risk = 0.37:1) -- the stop is deliberately set wide (never
+    # inside a level that would invalidate the pattern) but the target was never recalibrated
+    # against that width, so even a 68% win rate produced a NEGATIVE average return. A
+    # professional trader simply skips a setup whose own geometry doesn't clear a sane
+    # reward:risk bar, rather than taking it and hoping the win rate carries it -- this is that
+    # discipline, enforced at candidate-selection time in signals/engine.py.
+    min_reward_risk_ratio: float = field(default_factory=lambda: _env_float("MIN_REWARD_RISK_RATIO", 1.2))
 
 
 @dataclass(frozen=True)

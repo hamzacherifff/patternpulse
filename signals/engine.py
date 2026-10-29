@@ -14,7 +14,7 @@ from learning.ml_model import predict_win_probability
 from learning.weights import get_pattern_weight
 from patterns.candlestick import detect_candlestick_patterns
 from patterns.chart_patterns import detect_all as detect_chart_patterns
-from signals.risk import compute_risk_plan
+from signals.risk import compute_risk_plan, compute_stop_price
 from signals.strategy_selector import is_combo_allowed
 
 CONFIDENCE_THRESHOLD = 0.55
@@ -113,7 +113,7 @@ class SignalEngine:
         # Skip pattern types or symbols with a PROVEN bad track record (see
         # signals/strategy_selector.py) -- still-unproven ones pass through untouched, this
         # only benches things that have already demonstrated negative expectancy.
-        chart_matches = [m for m in chart_matches if is_combo_allowed(m["pattern"], symbol)]
+        chart_matches = [m for m in chart_matches if is_combo_allowed(m["pattern"], symbol, timeframe)]
         if not chart_matches:
             return None
 
@@ -126,6 +126,21 @@ class SignalEngine:
         best = None
         for match in chart_matches:
             direction = match["direction"]
+
+            # Reward:risk discipline, checked before this candidate is even scored -- a
+            # professional trader skips a setup whose own geometry doesn't justify the risk,
+            # no matter how "confident" the pattern otherwise looks. Real production data
+            # (1293 resolved signals) showed 95% of signals had a target closer than the
+            # stop (median 0.37:1), which is why a 68% win rate still produced a negative
+            # average return: the stop is deliberately set wide (never inside the pattern's
+            # own invalidation level) but nothing ever checked the target against that width.
+            candidate_stop = compute_stop_price(direction, entry_price, atr, match["invalidation_price"])
+            stop_distance = abs(entry_price - candidate_stop)
+            target_distance = abs(match["target_price"] - entry_price)
+            reward_risk_ratio = (target_distance / stop_distance) if stop_distance > 0 else 0.0
+            if reward_risk_ratio < risk_config.min_reward_risk_ratio:
+                continue
+
             confirm_score, snapshot = _confirmation_score(df_ind, i, direction)
             candle_confirms = direction in candle_directions
             trend_agrees = higher_trend == "flat" or \
@@ -146,6 +161,7 @@ class SignalEngine:
                 sample_size=weight["total"],
                 pattern_avg_return=weight["avg_return"],
                 expectancy_adjustment=round(expectancy_adjustment, 4),
+                reward_risk_ratio=round(reward_risk_ratio, 3),
             )
 
             # Once a trained model exists (see learning/ml_model.py), blend its win-probability

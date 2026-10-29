@@ -106,6 +106,52 @@ def get_pattern_type_performance(pattern_type: str) -> dict:
     return {"win_rate": win_rate, "avg_return": agg["avg_return"], "total": agg["total"]}
 
 
+def get_pattern_timeframe_performance(pattern_type: str, timeframe: str) -> dict:
+    """Aggregate performance for a (pattern_type, timeframe) pair across every symbol --
+    used by signals/strategy_selector.py alongside get_pattern_type_performance() and
+    get_pattern_symbol_performance(). Added after real production data showed timeframe
+    alone was a huge swing factor independent of symbol: 5m signals had a median
+    reward:risk of 0.31 vs 0.85 on 4h for the exact same pattern types, because faster
+    timeframes are noisier relative to a fixed ATR-based stop. A pattern can look fine in
+    aggregate while still being a structurally bad bet on one specific timeframe."""
+    conn = get_db()
+    rows = conn.execute(
+        f"SELECT {_STATS_COLS} FROM pattern_stats WHERE pattern_type = ? AND timeframe = ?",
+        (pattern_type, timeframe),
+    ).fetchall()
+    agg = _aggregate(rows)
+    win_rate = agg["wins"] / agg["total"] if agg["total"] else DEFAULT_PRIOR_WIN_RATE
+    return {"win_rate": win_rate, "avg_return": agg["avg_return"], "total": agg["total"]}
+
+
+def get_symbol_sizing_multiplier(symbol: str) -> float:
+    """A bounded, continuous position-sizing dial (NOT a signal-blocking veto) based on how
+    a symbol has performed in aggregate across every pattern that has fired on it. Scales
+    linearly from SIZING_FLOOR at avg_return <= SIZING_RETURN_FLOOR up to SIZING_CEILING at
+    avg_return >= SIZING_RETURN_CEILING, pinned at 1.0 (neutral) until there's enough
+    history to trust the signal.
+
+    Deliberately a sizing multiplier rather than a pattern/signal veto: an earlier version
+    of symbol-level filtering (removed) blocked ALL patterns on a symbol whenever the
+    symbol's cross-pattern average happened to be negative -- which blocked genuinely good
+    patterns (e.g. double_bottom at +0.28% avg_return) on symbols where a few unrelated bad
+    patterns dragged the blended average down. A smooth sizing dial captures the same
+    "this crypto has been rougher to trade than that one" signal without ever preventing an
+    individually-good trade from firing -- worst case it's sized a bit smaller or larger
+    than neutral, never blocked."""
+    conn = get_db()
+    rows = conn.execute(f"SELECT {_STATS_COLS} FROM pattern_stats WHERE symbol = ?", (symbol,)).fetchall()
+    agg = _aggregate(rows)
+    if agg["total"] < MIN_SAMPLES_FOR_TRUST * 3:  # symbol aggregates mix many patterns, so demand more evidence
+        return 1.0
+
+    SIZING_FLOOR, SIZING_CEILING = 0.6, 1.3
+    SIZING_RETURN_FLOOR, SIZING_RETURN_CEILING = -0.5, 0.5  # percent avg_return
+    t = (agg["avg_return"] - SIZING_RETURN_FLOOR) / (SIZING_RETURN_CEILING - SIZING_RETURN_FLOOR)
+    t = min(max(t, 0.0), 1.0)
+    return SIZING_FLOOR + t * (SIZING_CEILING - SIZING_FLOOR)
+
+
 def get_pattern_symbol_performance(pattern_type: str, symbol: str) -> dict:
     """Aggregate performance for one specific (pattern_type, symbol) pair across every
     timeframe -- this is the actual "combo" signals/strategy_selector.py needs to judge.

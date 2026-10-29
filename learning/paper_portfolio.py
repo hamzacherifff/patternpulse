@@ -22,12 +22,26 @@ has its own cap inside signals/risk.py, but that cap didn't account for THIS mod
 stacking on top of it), real production trades were sized at up to 243% of the account in a
 single position. Both are fixed here: MAX_POSITION_FRACTION caps the combined (base x leverage)
 fraction, and leverage is computed from calibrated_confidence() instead of the raw score.
+
+Two more sizing dials were added once the system had enough history to support them, both
+continuous multipliers rather than binary switches, closer to how a professional actually
+manages risk day to day instead of applying one static formula forever:
+
+- get_symbol_sizing_multiplier() (learning/weights.py) scales size down for symbols that
+  have genuinely underperformed in aggregate, and up for ones that have outperformed --
+  deliberately a sizing dial, not a signal-blocking veto (see that function's docstring for
+  why a veto at this grain caused a real bug previously).
+- recent_performance_multiplier() dampens size during a cold streak (the last RECENT_WINDOW
+  resolved trades trending negative) and allows a modest boost during a hot one, computed
+  causally in compute_paper_history() (only ever looks at trades strictly before the one
+  being sized) and from live recent history in get_open_paper_positions().
 """
 
 import pandas as pd
 
 from core.db import get_db
 from core.settings import get_float_setting, set_setting
+from learning.weights import get_symbol_sizing_multiplier
 
 DEFAULT_STARTING_CAPITAL = 1000.0
 _SETTING_KEY = "paper_starting_capital"
@@ -62,6 +76,17 @@ MAX_POSITION_FRACTION = 0.20
 # bins so "what leverage uses" and "what the chart shows you" are always the same thing.
 _CALIBRATION_BINS = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 CALIBRATION_MIN_SAMPLES = 15  # below this, a bucket's empirical rate is too noisy to trust over the raw score
+
+# A professional trader trades smaller after a cold streak and lets size run a little after a
+# hot one, instead of sizing every trade off a single static formula regardless of how the
+# system has actually been doing lately. RECENT_WINDOW trades is roughly a day or two of real
+# activity at current volume -- long enough to smooth over normal per-trade noise, short
+# enough to actually react to a regime change instead of being swamped by all-time history.
+RECENT_WINDOW = 30
+RECENT_DAMPEN_FLOOR = 0.5       # leverage multiplier at or beyond RECENT_DAMPEN_RETURN_FLOOR
+RECENT_DAMPEN_RETURN_FLOOR = -0.5   # percent avg_return over the recent window
+RECENT_BOOST_CEILING = 1.15     # modest; MAX_POSITION_FRACTION is still the hard backstop
+RECENT_BOOST_RETURN_CEILING = 0.5
 
 
 def get_starting_capital() -> float:
@@ -115,6 +140,32 @@ def confidence_leverage(confidence: float, calibration_table: pd.DataFrame = Non
     return MIN_LEVERAGE + t * (MAX_LEVERAGE - MIN_LEVERAGE)
 
 
+def recent_performance_multiplier(rolling_avg_return) -> float:
+    """Maps a recent-window average return% to a leverage multiplier: dampens toward
+    RECENT_DAMPEN_FLOOR during a cold streak, boosts modestly toward RECENT_BOOST_CEILING
+    during a hot one, neutral (1.0) when there isn't a recent window yet (NaN/None)."""
+    if rolling_avg_return is None or pd.isna(rolling_avg_return):
+        return 1.0
+    if rolling_avg_return >= 0:
+        t = min(rolling_avg_return / RECENT_BOOST_RETURN_CEILING, 1.0)
+        return 1.0 + t * (RECENT_BOOST_CEILING - 1.0)
+    t = min(abs(rolling_avg_return) / abs(RECENT_DAMPEN_RETURN_FLOOR), 1.0)
+    return 1.0 - t * (1.0 - RECENT_DAMPEN_FLOOR)
+
+
+def _current_recent_window_avg_return(limit: int = RECENT_WINDOW):
+    """Same idea as the rolling column in compute_paper_history(), but for "right now" --
+    used by get_open_paper_positions(), which isn't replaying history so has no rolling
+    column to read from."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT o.return_pct FROM outcomes o ORDER BY o.resolved_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+    if len(rows) < 5:
+        return None
+    return sum(r["return_pct"] for r in rows) / len(rows)
+
+
 def compute_paper_history(starting_capital: float) -> pd.DataFrame:
     """Every resolved signal, in the order it resolved, with a running `simulated_balance`
     column. Empty DataFrame if nothing has resolved yet."""
@@ -137,7 +188,21 @@ def compute_paper_history(starting_capital: float) -> pd.DataFrame:
         [float("inf"), -float("inf")], 0
     ).fillna(0.0)
     leverage = df["confidence"].apply(lambda c: confidence_leverage(c, calibration_table))
-    effective_fraction = (risk_fraction * leverage).clip(upper=MAX_POSITION_FRACTION)
+
+    # Causal: only ever looks at the RECENT_WINDOW trades strictly before this one
+    # (shift(1)), so a historical point in the replay never gets leverage informed by
+    # outcomes that, at that point in time, hadn't happened yet.
+    rolling_recent_return = df["return_pct"].rolling(RECENT_WINDOW, min_periods=5).mean().shift(1)
+    recent_multiplier = rolling_recent_return.apply(recent_performance_multiplier)
+
+    # Computed once per distinct symbol (a handful of watchlist entries), not once per row --
+    # get_symbol_sizing_multiplier() hits the DB, and this can replay 1000+ rows.
+    symbol_mult_by_symbol = {sym: get_symbol_sizing_multiplier(sym) for sym in df["symbol"].unique()}
+    symbol_multiplier = df["symbol"].map(symbol_mult_by_symbol)
+
+    effective_fraction = (risk_fraction * leverage * recent_multiplier * symbol_multiplier).clip(
+        upper=MAX_POSITION_FRACTION
+    )
 
     balance = starting_capital
     balances, sizes = [], []
@@ -182,13 +247,18 @@ def get_open_paper_positions(current_balance: float) -> list[dict]:
         return []
 
     calibration_table = load_calibration_table()
+    recent_multiplier = recent_performance_multiplier(_current_recent_window_avg_return())
+    symbol_mult_by_symbol = {}
     available = current_balance
     result = []
     for r in rows:
         d = dict(r)
         base_frac = (d["position_size_suggested"] / d["portfolio_size_at_signal"]) if d["portfolio_size_at_signal"] else 0.0
         leverage = confidence_leverage(d["confidence"], calibration_table)
-        wanted = current_balance * min(base_frac * leverage, MAX_POSITION_FRACTION)
+        if d["symbol"] not in symbol_mult_by_symbol:
+            symbol_mult_by_symbol[d["symbol"]] = get_symbol_sizing_multiplier(d["symbol"])
+        symbol_multiplier = symbol_mult_by_symbol[d["symbol"]]
+        wanted = current_balance * min(base_frac * leverage * recent_multiplier * symbol_multiplier, MAX_POSITION_FRACTION)
         size = max(min(wanted, available), 0.0)
         d["confidence_leverage"] = leverage
         d["simulated_position_size"] = size
